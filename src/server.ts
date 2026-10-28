@@ -37,6 +37,7 @@ type MonitorParams = {
   id: string;
 };
 
+// ค้นหาบริการจาก SQLite
 const findMonitor = db.prepare(`
   SELECT
     id,
@@ -47,6 +48,72 @@ const findMonitor = db.prepare(`
   WHERE id = ?
 `);
 
+// ตรวจสอบบริการและบันทึกผลลง SQLite
+async function performCheck(
+  monitor: Monitor,
+): Promise<CheckResult> {
+  const startedAt = Date.now();
+
+  let status: CheckResult['status'] = 'down';
+  let statusCode: number | null = null;
+  let error: string | undefined;
+
+  try {
+    const response = await fetch(monitor.url, {
+      signal: AbortSignal.timeout(5000),
+      redirect: 'manual',
+    });
+
+    statusCode = response.status;
+    status = response.ok ? 'up' : 'down';
+
+    if (!response.ok) {
+      error = `HTTP ${response.status}`;
+    }
+
+    await response.body?.cancel();
+  } catch (err) {
+    status = 'down';
+    error = err instanceof Error
+      ? err.message
+      : 'Unknown error';
+  }
+
+  const result: CheckResult = {
+    id: randomUUID(),
+    monitorId: monitor.id,
+    checkedAt: new Date().toISOString(),
+    status,
+    statusCode,
+    responseTimeMs: Date.now() - startedAt,
+    ...(error ? { error } : {}),
+  };
+
+  db.prepare(`
+    INSERT INTO check_history (
+      id,
+      monitor_id,
+      checked_at,
+      status,
+      status_code,
+      response_time_ms,
+      error
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    result.id,
+    result.monitorId,
+    result.checkedAt,
+    result.status,
+    result.statusCode,
+    result.responseTimeMs,
+    result.error ?? null,
+  );
+
+  return result;
+}
+
+// Health Check ของ PulseCheck เอง
 app.get('/health', async () => {
   return {
     status: 'ok',
@@ -55,6 +122,7 @@ app.get('/health', async () => {
   };
 });
 
+// เพิ่มบริการที่ต้องการตรวจสอบ
 app.post<{ Body: CreateMonitorBody }>(
   '/monitors',
   {
@@ -120,6 +188,7 @@ app.post<{ Body: CreateMonitorBody }>(
   },
 );
 
+// แสดงบริการทั้งหมด
 app.get('/monitors', async () => {
   return db.prepare(`
     SELECT
@@ -132,6 +201,7 @@ app.get('/monitors', async () => {
   `).all() as Monitor[];
 });
 
+// สั่งตรวจสอบบริการด้วยตนเอง
 app.post<{ Params: MonitorParams }>(
   '/monitors/:id/check',
   async (request, reply) => {
@@ -145,61 +215,7 @@ app.post<{ Params: MonitorParams }>(
       });
     }
 
-    const startedAt = Date.now();
-
-    let status: CheckResult['status'] = 'down';
-    let statusCode: number | null = null;
-    let error: string | undefined;
-
-    try {
-      const response = await fetch(monitor.url, {
-        signal: AbortSignal.timeout(5000),
-        redirect: 'manual',
-      });
-
-      statusCode = response.status;
-      status = response.ok ? 'up' : 'down';
-
-      if (!response.ok) {
-        error = `HTTP ${response.status}`;
-      }
-
-      await response.body?.cancel();
-    } catch (err) {
-      status = 'down';
-      error = err instanceof Error ? err.message : 'Unknown error';
-    }
-
-    const result: CheckResult = {
-      id: randomUUID(),
-      monitorId: monitor.id,
-      checkedAt: new Date().toISOString(),
-      status,
-      statusCode,
-      responseTimeMs: Date.now() - startedAt,
-      ...(error ? { error } : {}),
-    };
-
-    db.prepare(`
-      INSERT INTO check_history (
-        id,
-        monitor_id,
-        checked_at,
-        status,
-        status_code,
-        response_time_ms,
-        error
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      result.id,
-      result.monitorId,
-      result.checkedAt,
-      result.status,
-      result.statusCode,
-      result.responseTimeMs,
-      result.error ?? null,
-    );
+    const result = await performCheck(monitor);
 
     request.log.info(
       {
@@ -214,6 +230,7 @@ app.post<{ Params: MonitorParams }>(
   },
 );
 
+// แสดงประวัติการตรวจสอบ
 app.get<{ Params: MonitorParams }>(
   '/monitors/:id/history',
   async (request, reply) => {
@@ -245,18 +262,108 @@ app.get<{ Params: MonitorParams }>(
   },
 );
 
+// ตั้งค่ารอบการตรวจสอบ: ค่าเริ่มต้น 60 วินาที
+const monitorIntervalMs = Number(
+  process.env.MONITOR_INTERVAL_MS ?? 60_000,
+);
+
+let schedulerRunning = false;
+
+// ตรวจบริการทุกตัวที่เก็บไว้ใน SQLite
+async function runScheduledChecks(): Promise<void> {
+  if (schedulerRunning) {
+    app.log.warn(
+      'Previous scheduled check is still running; skipping this cycle',
+    );
+    return;
+  }
+
+  schedulerRunning = true;
+
+  try {
+    const monitorsToCheck = db.prepare(`
+      SELECT
+        id,
+        name,
+        url,
+        created_at AS createdAt
+      FROM monitors
+      ORDER BY created_at ASC
+    `).all() as Monitor[];
+
+    for (const monitor of monitorsToCheck) {
+      try {
+        const result = await performCheck(monitor);
+
+        app.log.info(
+          {
+            monitorId: monitor.id,
+            status: result.status,
+            responseTimeMs: result.responseTimeMs,
+          },
+          'Scheduled monitor check completed',
+        );
+      } catch (error) {
+        app.log.error(
+          { err: error, monitorId: monitor.id },
+          'Scheduled monitor check failed',
+        );
+      }
+    }
+  } finally {
+    schedulerRunning = false;
+  }
+}
+
+// เริ่มตรวจทันทีหนึ่งครั้ง และตรวจซ้ำตามรอบเวลา
+function startMonitoringScheduler(): void {
+  if (
+    !Number.isSafeInteger(monitorIntervalMs) ||
+    monitorIntervalMs < 1000
+  ) {
+    throw new Error(
+      'MONITOR_INTERVAL_MS must be an integer of at least 1000',
+    );
+  }
+
+  app.log.info(
+    { intervalMs: monitorIntervalMs },
+    'Monitoring scheduler started',
+  );
+
+  void runScheduledChecks().catch((error) => {
+    app.log.error(
+      { err: error },
+      'Scheduled monitoring run failed',
+    );
+  });
+
+  setInterval(() => {
+    void runScheduledChecks().catch((error) => {
+      app.log.error(
+        { err: error },
+        'Scheduled monitoring run failed',
+      );
+    });
+  }, monitorIntervalMs);
+}
+
+// เริ่มเซิร์ฟเวอร์ก่อน แล้วจึงเปิด Scheduler
 const start = async () => {
   try {
     await app.listen({
       port: 3000,
       host: '127.0.0.1',
     });
+
+    startMonitoringScheduler();
   } catch (error) {
     app.log.error(error);
     process.exit(1);
   }
 };
 
+// ไม่เปิดเซิร์ฟเวอร์หรือ Scheduler อัตโนมัติระหว่างทดสอบ
 if (process.env.NODE_ENV !== 'test') {
   void start();
 }
