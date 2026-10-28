@@ -1,6 +1,7 @@
 
 import Fastify from 'fastify';
 import { randomUUID } from 'node:crypto';
+import { db } from './db.js';
 
 const app = Fastify({
   logger: true,
@@ -23,6 +24,10 @@ type CheckResult = {
   error?: string;
 };
 
+type HistoryRow = Omit<CheckResult, 'error'> & {
+  error: string | null;
+};
+
 type CreateMonitorBody = {
   name: string;
   url: string;
@@ -32,10 +37,16 @@ type MonitorParams = {
   id: string;
 };
 
-const monitors: Monitor[] = [];
-const history: CheckResult[] = [];
+const findMonitor = db.prepare(`
+  SELECT
+    id,
+    name,
+    url,
+    created_at AS createdAt
+  FROM monitors
+  WHERE id = ?
+`);
 
-// 1. ตรวจสอบสุขภาพของ PulseCheck เอง
 app.get('/health', async () => {
   return {
     status: 'ok',
@@ -44,7 +55,6 @@ app.get('/health', async () => {
   };
 });
 
-// 2. ลงทะเบียนบริการที่ต้องการตรวจสอบ
 app.post<{ Body: CreateMonitorBody }>(
   '/monitors',
   {
@@ -96,24 +106,38 @@ app.post<{ Body: CreateMonitorBody }>(
       createdAt: new Date().toISOString(),
     };
 
-    monitors.push(monitor);
+    db.prepare(`
+      INSERT INTO monitors (id, name, url, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(
+      monitor.id,
+      monitor.name,
+      monitor.url,
+      monitor.createdAt,
+    );
 
     return reply.code(201).send(monitor);
   },
 );
 
-// 3. ดูรายการบริการทั้งหมด
 app.get('/monitors', async () => {
-  return monitors;
+  return db.prepare(`
+    SELECT
+      id,
+      name,
+      url,
+      created_at AS createdAt
+    FROM monitors
+    ORDER BY created_at DESC
+  `).all() as Monitor[];
 });
 
-// 4. สั่งตรวจสอบบริการตาม ID
 app.post<{ Params: MonitorParams }>(
   '/monitors/:id/check',
   async (request, reply) => {
-    const monitor = monitors.find(
-      (item) => item.id === request.params.id,
-    );
+    const monitor = findMonitor.get(request.params.id) as
+      | Monitor
+      | undefined;
 
     if (!monitor) {
       return reply.code(404).send({
@@ -156,7 +180,26 @@ app.post<{ Params: MonitorParams }>(
       ...(error ? { error } : {}),
     };
 
-    history.push(result);
+    db.prepare(`
+      INSERT INTO check_history (
+        id,
+        monitor_id,
+        checked_at,
+        status,
+        status_code,
+        response_time_ms,
+        error
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      result.id,
+      result.monitorId,
+      result.checkedAt,
+      result.status,
+      result.statusCode,
+      result.responseTimeMs,
+      result.error ?? null,
+    );
 
     request.log.info(
       {
@@ -171,13 +214,10 @@ app.post<{ Params: MonitorParams }>(
   },
 );
 
-// 5. ดูประวัติการตรวจสอบของบริการ
 app.get<{ Params: MonitorParams }>(
   '/monitors/:id/history',
   async (request, reply) => {
-    const monitor = monitors.find(
-      (item) => item.id === request.params.id,
-    );
+    const monitor = findMonitor.get(request.params.id);
 
     if (!monitor) {
       return reply.code(404).send({
@@ -185,13 +225,26 @@ app.get<{ Params: MonitorParams }>(
       });
     }
 
-    return history.filter(
-      (result) => result.monitorId === monitor.id,
+    const rows = db.prepare(`
+      SELECT
+        id,
+        monitor_id AS monitorId,
+        checked_at AS checkedAt,
+        status,
+        status_code AS statusCode,
+        response_time_ms AS responseTimeMs,
+        error
+      FROM check_history
+      WHERE monitor_id = ?
+      ORDER BY checked_at ASC, id ASC
+    `).all(request.params.id) as HistoryRow[];
+
+    return rows.map(({ error, ...result }) =>
+      error ? { ...result, error } : result,
     );
   },
 );
 
-// 6. เริ่มเซิร์ฟเวอร์
 const start = async () => {
   try {
     await app.listen({
